@@ -1,0 +1,17 @@
+# Core ML
+torch
+torchvision
+scikit-learn>=1.3
+joblib
+
+# Data
+numpy
+pandas
+scipy
+
+# Image / plotting
+Pillow
+matplotlib
+
+# HuggingFace ecosystem
+huggingface_hub>=0.20
