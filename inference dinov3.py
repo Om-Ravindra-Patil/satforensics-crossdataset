@@ -1,219 +1,197 @@
-import os, csv, importlib.util
+import os, csv
 import numpy as np
 import torch
 from tqdm import tqdm
+import cv2
+import tifffile
+import rasterio
+import importlib.util
+from sklearn.metrics import classification_report
 
-# ============================ CONFIG ============================ #
-TRAIN_SCRIPT    = "/home/c3068579/Downloads/Train_DINOV3.py"
-CKPT_PATH       = "satforensics_dino_film_flow.pth"
+# ================= CONFIG ================= #
+TRAIN_SCRIPT = "/home/c3068579/Downloads/Train_DINOV3.py"
+CKPT_PATH    = "satforensics_dino_film_flow.pth"
 
-DATA_DIR        = "/home/c3068579/Documents/inference_results_vc10/DiffusionSat/outputs_fmow_real_5pct_jpg"
-REAL_PREFIX     = "sn2"
+DATA_DIR     = "/home/c3068579/Documents/inference_results_vc10/DiffusionSat/outputs_fmow_real_jpg"
+CSV_OUT      = "output_calibrated.csv"
 
-MODIS_PATH      = "/home/c3068579/Documents/wholeworld_epsg4326.tif"
-RADIO_CACHE_DIR = "/home/c3068579/Documents/radio_cache_dino"
+SAMPLE_FRAC  = 1
+IMG_EXTS     = ('.tif', '.tiff', '.jp2', '.png', '.jpg', '.jpeg')
 
-CSV_OUT         = "inference_results.csv"
-
-USE_MODIS       = True
-# =============================================================== #
-
-IMG_EXTS = ('.tif', '.tiff', '.jp2', '.png', '.jpg', '.jpeg')
-
-
-# ---------------- NORMALISATION ---------------- #
-def _to_float01(img):
-    img = np.asarray(img).astype(np.float32)
-    mx = float(img.max()) if img.size else 1.0
-
-    if   mx <= 1.5:     denom = 1.0
-    elif mx <= 255.0:   denom = 255.0
-    elif mx <= 4095.0:  denom = 4095.0
-    elif mx <= 65535.0: denom = 65535.0
-    else:               denom = mx
-
-    return np.clip(img / denom, 0.0, 1.0)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-# ---------------- LOAD TRAIN MODULE ---------------- #
-def load_train_module(path, modis_path):
-    import rasterio
+# ================= GROUND TRUTH HELPERS ================= #
+def is_ground_truth_manipulated(path):
+    """
+    Non-SN2 imagery (fMoW datasets) represent the manipulated pool.
+    """
+    return "SN2_" not in os.path.basename(path)
 
-    spec = importlib.util.spec_from_file_location("satforensics_train", path)
+
+# ================= LOAD MODULE & IMAGES ================= #
+def load_module(path):
+    spec = importlib.util.spec_from_file_location("sat", path)
     mod = importlib.util.module_from_spec(spec)
-
-    orig_open = rasterio.open
-    first = {"used": False}
-
-    def _patched(p, *a, **k):
-        if first["used"]:
-            return orig_open(p, *a, **k)
-        first["used"] = True
-        return orig_open(modis_path, *a, **k)
-
-    rasterio.open = _patched
-    try:
-        spec.loader.exec_module(mod)
-    finally:
-        rasterio.open = orig_open
-
-    mod.MODIS_PATH = modis_path
+    spec.loader.exec_module(mod)
     return mod
 
-
-def configure_paths(T):
-    import rasterio
-    T.RADIO_CACHE_DIR = RADIO_CACHE_DIR
-    T.USE_MODIS = USE_MODIS
-    T.modis_src = rasterio.open(MODIS_PATH) if USE_MODIS else None
-
-
-# ---------------- IMAGE LOADING ---------------- #
-def find_images(root):
-    out = []
-    for r, _, files in os.walk(root):
-        for f in files:
-            if f.lower().endswith(IMG_EXTS):
-                out.append(os.path.join(r, f))
-    return sorted(out)
-
-
-def load_image(path):
-    import tifffile, rasterio, cv2
-
+def load_image(path, size):
     ext = os.path.splitext(path)[1].lower()
+    if ext in ('.tif', '.tiff'):
+        try: img = tifffile.imread(path)
+        except:
+            with rasterio.open(path) as src: img = src.read().transpose(1,2,0)
+    else:
+        img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        if img is None: raise ValueError(path)
+        if len(img.shape) == 3: img = img[..., ::-1]
 
-    try:
-        if ext in ('.tif', '.tiff'):
-            try:
-                img = tifffile.imread(path)
-            except:
-                with rasterio.open(path) as src:
-                    img = src.read().transpose(1,2,0)
-        else:
-            img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
-            if img is None:
-                raise ValueError("cv2 failed")
-
-            if img.ndim == 3:
-                img = img[..., ::-1]
-
-        img = np.asarray(img)
-
-        if img.ndim == 2:
-            img = np.stack([img]*3, axis=-1)
-
-        if img.shape[2] > 3:
-            img = img[..., :3]
-
-        return _to_float01(img)
-
-    except Exception as e:
-        raise RuntimeError(f"Failed loading {path}: {e}")
+    if img.ndim == 2: img = np.stack([img]*3, -1)
+    if img.shape[2] > 3: img = img[..., :3]
+    img = img.astype(np.float32)
+    mx = img.max() if img.size else 1.0
+    img = img / (255.0 if mx > 1.5 else 1.0)
+    return cv2.resize(img, (size, size), interpolation=cv2.INTER_LINEAR)
 
 
-# ---------------- MAIN ---------------- #
+# ================= SCORE ENGINE ================= #
+def score_tile(model, T, rgb, radio, modis):
+    with torch.no_grad():
+        out = model(rgb, radio, modis)
+    if not isinstance(out, (tuple, list)): return None
+
+    rec, latent, aux = out[0], out[1] if len(out) > 1 else None, out[2] if len(out) > 2 else None
+    rec_err = (rec - rgb).abs().mean().item()
+    latent_err = latent.abs().mean().item() if torch.is_tensor(latent) else 0.0
+    aux_err = aux.abs().mean().item() if torch.is_tensor(aux) else 0.0
+
+    score = (0.6 * rec_err) + (0.3 * latent_err) + (0.1 * aux_err)
+    return rec_err, latent_err, aux_err, score
+
+
+# ================= MAIN ================= #
 def main():
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    T = load_train_module(TRAIN_SCRIPT, MODIS_PATH)
-    configure_paths(T)
-
+    T = load_module(TRAIN_SCRIPT)
     blob = torch.load(CKPT_PATH, map_location=device, weights_only=False)
-    calib = blob.get("calibration", {})
-    state = blob["state_dict"]
-
-    model = T.DinoRadModisAE(
-        use_modis=calib.get("use_modis", USE_MODIS)
-    ).to(device)
-
-    model.load_state_dict(state, strict=False)
+    model = T.DinoRadModisAE(use_modis=True).to(device)
+    model.load_state_dict(blob["state_dict"], strict=False)
     model.eval()
+    size = T.ENCODER_SIZE
 
-    imgs = find_images(DATA_DIR)
+    # 1. Gather files
+    all_imgs = []
+    for r, _, fs in os.walk(DATA_DIR):
+        for f in fs:
+            if f.lower().endswith(IMG_EXTS):
+                all_imgs.append(os.path.join(r, f))
 
-    print(f"[ok] total images: {len(imgs)}")
+    np.random.shuffle(all_imgs)
+    selected_imgs = all_imgs[:max(1, int(len(all_imgs) * SAMPLE_FRAC))]
 
+    # Isolate pools by ground truth
+    all_genuine = [p for p in selected_imgs if not is_ground_truth_manipulated(p)]
+    all_manipulated = [p for p in selected_imgs if is_ground_truth_manipulated(p)]
+
+    np.random.shuffle(all_genuine)
+    np.random.shuffle(all_manipulated)
+
+    # 10% of the pristine (genuine) pool sizes each reserved block
+    num_genuine = len(all_genuine)
+    block_size = max(1, int(num_genuine * 0.10))
+
+    # --- ALLOCATE SPLITS ---
+    # Calibration: first 10% of genuine (100% pristine reference)
+    sn2_ref_imgs = all_genuine[:block_size]
+
+    # Tune: next 10% of genuine (100% pristine, for threshold selection)
+    tune_imgs = all_genuine[block_size : 2 * block_size]
+
+    # Eval/test: everything else — remaining 80% genuine + all manipulated
+    eval_imgs = all_genuine[2 * block_size:] + all_manipulated
+
+    # Nothing discarded now
+    unused_imgs = []
+
+    print(f"[INFO] Data Routing Summary:")
+    print(f"       -> Calibration (sn2_ref): {len(sn2_ref_imgs)} (100% Genuine)")
+    print(f"       -> Tune Set (tune_10):   {len(tune_imgs)} (100% Genuine)")
+    n_gen_eval = len(all_genuine[2 * block_size:])
+    n_man_eval = len(all_manipulated)
+    print(f"       -> Eval Set (eval_10):   {len(eval_imgs)} ({n_gen_eval} Genuine / {n_man_eval} Manipulated)")
+
+    # 2. Process and score everything
     rows = []
-
-    threshold = calib.get("threshold", 0.5)
-
-    for p in tqdm(imgs, desc="infer"):
-
+    for p in tqdm(selected_imgs, desc="Scoring dataset"):
         try:
-            img = load_image(p)
+            img = load_image(p, size)
+            rgb = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0).to(device)
+            radio = torch.zeros(1, T.RADIO_SPATIAL_GRID, T.RADIO_SPATIAL_GRID, T.RADIO_DIM, device=device)
+            modis = torch.tensor([0], device=device)
+
+            rec_err, latent_err, aux_err, score = score_tile(model, T, rgb, radio, modis)
+
+            # Determine split allocation mapping
+            if p in sn2_ref_imgs: split_label = "sn2_ref"
+            elif p in tune_imgs: split_label = "tune_10"
+            elif p in eval_imgs: split_label = "eval_10"
+            else: split_label = "unused"
+
+            gt_label = "manipulated" if is_ground_truth_manipulated(p) else "genuine"
+
+            rows.append({
+                "image": p,
+                "split": split_label,
+                "rec_err": rec_err,
+                "latent_err": latent_err,
+                "aux_err": aux_err,
+                "score": score,
+                "ground_truth": gt_label
+            })
         except Exception as e:
-            print("[skip]", p, e)
-            continue
+            print("[SKIP]", p, e)
 
-        H, W = img.shape[:2]
+    # 3. TUNE STAGE: Since tune_10 is entirely genuine, pick a threshold based on target False Positive Rate
+    tune_rows = [r for r in rows if r["split"] == "tune_10"]
 
-        ys = T.compute_adaptive_positions(H, T.ENCODER_SIZE)
-        xs = T.compute_adaptive_positions(W, T.ENCODER_SIZE)
+    if len(tune_rows) > 0:
+        tune_scores = [r["score"] for r in tune_rows]
+        # Set threshold at the 5th percentile of genuine data (allows a 5% False Positive Rate target)
+        best_threshold = np.percentile(tune_scores, 5)
+        print(f"\n[TUNING COMPLETE] Threshold set at 5th percentile of genuine data: {best_threshold:.4f}")
+    else:
+        ref_scores = [r["score"] for r in rows if r["split"] == "sn2_ref"]
+        best_threshold = np.percentile(ref_scores, 5) if ref_scores else 0.0
+        print(f"\n[TUNING FALLBACK] Using 5th percentile calibration baseline: {best_threshold:.4f}")
 
-        scores = []
+    # 4. EVALUATE STAGE: Assign final labels using the tuned threshold
+    for r in rows:
+        r["threshold"] = best_threshold
+        if r["split"] == "sn2_ref":
+            r["label"] = "genuine"
+        else:
+            r["label"] = "manipulated" if r["score"] < best_threshold else "genuine"
 
-        for y in ys:
-            for x in xs:
+    # Print evaluation metrics for the test block
+    eval_rows = [r for r in rows if r["split"] == "eval_10"]
+    if eval_rows:
+        y_true = [r["ground_truth"] for r in eval_rows]
+        y_pred = [r["label"] for r in eval_rows]
 
-                patch = img[y:y+T.ENCODER_SIZE, x:x+T.ENCODER_SIZE]
+        eval_correct = sum(1 for r in eval_rows if r["label"] == r["ground_truth"])
+        print(f"\n[EVALUATION COMPLETE] Isolated Test Split Accuracy: {(eval_correct / len(eval_rows)) * 100:.2f}%")
 
-                if patch.shape[0] < 16 or patch.shape[1] < 16:
-                    continue
+        print("\n" + "="*30 + " CLASSIFICATION REPORT (EVAL SPLIT) " + "="*30)
+        print(classification_report(y_true, y_pred, digits=4))
+        print("="*96 + "\n")
 
-                import cv2
-                patch = cv2.resize(patch, (T.ENCODER_SIZE, T.ENCODER_SIZE))
+    # 5. Export results to output_calibrated.csv
+    with open(CSV_OUT, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=rows[0].keys())
+        w.writeheader()
+        w.writerows(rows)
 
-                rgb = T._norm_rgb(patch)
-
-                if isinstance(rgb, torch.Tensor):
-                    rgb = rgb.detach().cpu().numpy()
-
-                rgb = torch.from_numpy(rgb).unsqueeze(0).to(device)
-
-                modis = torch.tensor([0], device=device)
-
-                radio = torch.zeros(
-                    1,
-                    T.RADIO_SPATIAL_GRID,
-                    T.RADIO_SPATIAL_GRID,
-                    T.RADIO_DIM,
-                    device=device
-                )
-
-                with torch.no_grad():
-                    rec, latent, aux = model(rgb, radio, modis)
-
-                err = (rec - rgb).abs().mean().item()
-                scores.append(err)
-
-        if not scores:
-            continue
-
-        image_score = float(np.mean(sorted(scores)[-max(1, len(scores)//10):]))
-        label = "manipulated" if image_score > threshold else "genuine"
-
-        # ===================== NOTIFICATION ===================== #
-        if label == "genuine":
-            print(f"\n[PRISTINE DETECTED] {p}")
-            print(f"score={image_score:.6f} | threshold={threshold}")
-        # ======================================================= #
-
-        rows.append({
-            "image": p,
-            "score": image_score,
-            "label": label,
-            "threshold": threshold
-        })
-
-    if rows:
-        with open(CSV_OUT, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=rows[0].keys())
-            writer.writeheader()
-            writer.writerows(rows)
-
-    print("\nDONE ->", CSV_OUT)
+    print("DONE ->", CSV_OUT)
 
 
 if __name__ == "__main__":
