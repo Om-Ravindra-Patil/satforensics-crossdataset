@@ -1,6 +1,7 @@
 import os, csv, warnings
 import numpy as np
 import torch
+import torch.nn.functional as F
 from tqdm import tqdm
 import cv2
 import tifffile
@@ -30,17 +31,27 @@ GMM_KS       = (2, 3)        # mixture sizes to consider
 FORCE_MODEL  = "j_gmm_3"     # set to None to re-enable label-free model selection
 EPS          = 1e-9
 
-CHANNEL_NAMES = ("rec_err", "latent_err", "aux_err")
+# 4 signals now: rec / latent / aux / flow (flow NLL from the trained FastFlow2D head)
+CHANNEL_NAMES = ("rec_err", "latent_err", "aux_err", "flow_err")
 
 # ---------------- ABLATION RUNS ---------------- #
+# All singles, pairs, and triples of the 4 channels, plus the full model.
 FEATURE_SETS = {
-    "rec_only":     [0],
-    "latent_only":  [1],
-    "aux_only":     [2],
-    "rec_latent":   [0, 1],
-    "rec_aux":      [0, 2],
-    "latent_aux":   [1, 2],
-    "full":         [0, 1, 2],
+    "rec_only":         [0],
+    "latent_only":       [1],
+    "aux_only":          [2],
+    "flow_only":         [3],
+    "rec_latent":        [0, 1],
+    "rec_aux":           [0, 2],
+    "rec_flow":          [0, 3],
+    "latent_aux":        [1, 2],
+    "latent_flow":       [1, 3],
+    "aux_flow":          [2, 3],
+    "rec_latent_aux":    [0, 1, 2],
+    "rec_latent_flow":   [0, 1, 3],
+    "rec_aux_flow":      [0, 2, 3],
+    "latent_aux_flow":   [1, 2, 3],
+    "full":              [0, 1, 2, 3],
 }
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -77,18 +88,56 @@ def load_image(path, size):
     return cv2.resize(img, (size, size), interpolation=cv2.INTER_LINEAR)
 
 
+# ================= RADIO + MODIS (REAL, NOT ZEROS) ================= #
+def build_radio_grid(T, img_resized, dev):
+    """
+    img_resized: (size,size,3) float32 in [0,1] — the SAME resized image tensor
+    used for the RGB stream. We treat it as one whole-image "tile" (this script
+    does global whole-image inference, not tiled inference), so the radio grid
+    is computed directly over the resized image, exactly mirroring how the
+    training pipeline builds [abs_grid, abs_grid - baseline] per tile.
+    Returns a (1, RADIO_SPATIAL_GRID, RADIO_SPATIAL_GRID, RADIO_DIM) tensor.
+    """
+    abs_grid = T.compute_patch_radio_grid(img_resized, T.RADIO_SPATIAL_GRID, dev)   # (g,g,25)
+    baseline = T.compute_image_radio_baseline(img_resized, dev)                     # (25,)
+    residual = abs_grid - baseline[None, None, :]
+    radio_np = np.concatenate([abs_grid, residual], axis=-1)                        # (g,g,50)
+    return torch.from_numpy(radio_np).float().unsqueeze(0).to(dev)
+
+
+def get_modis_class_whole_image(T, img_path):
+    """Majority MODIS land-cover class over the FULL image footprint (not a sub-patch),
+    using the same MODIS raster + reprojection logic as the training script."""
+    if not T.USE_MODIS or T.modis_src is None:
+        return 0
+    try:
+        with T.rasterio.open(img_path) as im:
+            h, w = im.height, im.width
+            win = T.Window(0, 0, w, h)
+            bounds = T.rasterio.windows.bounds(win, im.transform)
+            b_modis = T.transform_bounds(im.crs, T.modis_src.crs, *bounds, densify_pts=21)
+        mwin = T.from_bounds(*b_modis, transform=T.modis_src.transform)
+        return T.get_modis_majority_class(mwin, T.modis_src)
+    except Exception:
+        return 0
+
+
 # ================= SCORE ENGINE ================= #
 def extract_errors(model, rgb, radio, modis):
+    """rec / latent / aux exactly as before, PLUS flow NLL from the trained
+    FastFlow2D head (model.flow), which the earlier version never touched."""
     with torch.no_grad():
-        out = model(rgb, radio, modis)
-    if not isinstance(out, (tuple, list)): return None
-    rec = out[0]
-    latent = out[1] if len(out) > 1 else None
-    aux = out[2] if len(out) > 2 else None
-    rec_err = (rec - rgb).abs().mean().item()
+        s = model.encode(rgb, radio, modis)
+        recon  = model.decoder(s)
+        latent = F.adaptive_avg_pool2d(s, 1).flatten(1)
+        aux    = model.aux_radio_head(s).mean(dim=(2, 3))
+        nll_map = model.flow.nll_map(s.float())
+
+    rec_err    = (recon - rgb).abs().mean().item()
     latent_err = latent.abs().mean().item() if torch.is_tensor(latent) else np.nan
-    aux_err = aux.abs().mean().item() if torch.is_tensor(aux) else np.nan
-    return rec_err, latent_err, aux_err
+    aux_err    = aux.abs().mean().item() if torch.is_tensor(aux) else np.nan
+    flow_err   = nll_map.mean().item() if torch.is_tensor(nll_map) else np.nan
+    return rec_err, latent_err, aux_err, flow_err
 
 
 # ================= NONLINEAR DENSITY SCORER ================= #
@@ -266,12 +315,17 @@ def main():
         try:
             img = load_image(p, size)
             rgb = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0).to(device)
-            radio = torch.zeros(1, T.RADIO_SPATIAL_GRID, T.RADIO_SPATIAL_GRID, T.RADIO_DIM, device=device)
-            modis = torch.tensor([0], device=device)
+
+            # --- REAL radio + MODIS (no more zeros) ---
+            radio = build_radio_grid(T, img, device)
+            mc = get_modis_class_whole_image(T, p)
+            mc = max(0, min(mc, T.NUM_MODIS_CLASSES - 1))
+            modis = torch.tensor([mc], dtype=torch.long, device=device)
+
             errs = extract_errors(model, rgb, radio, modis)
             if errs is None:
                 print("[SKIP]", p, "model output not tuple/list"); continue
-            rec_err, latent_err, aux_err = errs
+            rec_err, latent_err, aux_err, flow_err = errs
 
             if p in sn2_ref_imgs: split = "sn2_ref"
             elif p in tune_imgs:  split = "tune_10"
@@ -279,7 +333,7 @@ def main():
             else:                 split = "unused"
 
             rows.append({"image": p, "split": split, "rec_err": rec_err,
-                         "latent_err": latent_err, "aux_err": aux_err,
+                         "latent_err": latent_err, "aux_err": aux_err, "flow_err": flow_err,
                          "ground_truth": "manipulated" if is_ground_truth_manipulated(p) else "genuine"})
         except Exception as e:
             print("[SKIP]", p, e)
@@ -296,7 +350,7 @@ def main():
         print(f"# RUN: {run_name}  (features: {', '.join(feat_names)})")
         print("#" * 96)
 
-        def fv(r): return [[r["rec_err"], r["latent_err"], r["aux_err"]][i] for i in idxs]
+        def fv(r): return [[r["rec_err"], r["latent_err"], r["aux_err"], r["flow_err"]][i] for i in idxs]
         def usable(r): return not any(np.isnan(x) for x in fv(r))
 
         X_cal = np.array([fv(r) for r in rows if r["split"] == "sn2_ref" and usable(r)])
@@ -366,19 +420,20 @@ def main():
     # --- SUMMARY + MARGINAL VALUE ---
     if summary:
         print("\n" + "=" * 40 + " ABLATION SUMMARY " + "=" * 40)
-        print(f"{'Run':<12} {'Features':<24} {'Model':<12} {'AUROC':>7} {'AP':>7} "
+        print(f"{'Run':<18} {'Features':<24} {'Model':<12} {'AUROC':>7} {'AP':>7} "
               f"{'TPR':>6} {'FPR':>6} {'BalAcc':>7} {'Acc%':>7}")
-        print("-" * 100)
+        print("-" * 106)
         for s in summary:
-            print(f"{s['run']:<12} {s['features']:<24} {s['selected_model']:<12} "
+            print(f"{s['run']:<18} {s['features']:<24} {s['selected_model']:<12} "
                   f"{s['auroc']:>7.4f} {s['ap']:>7.4f} {s['tpr_at_thr']:>6.3f} "
                   f"{s['obs_fpr']:>6.3f} {s['balanced_acc']:>7.4f} {s['eval_accuracy_pct']:>7.2f}")
-        print("=" * 100)
+        print("=" * 106)
 
         by = {s["run"]: s for s in summary}
         if "full" in by:
-            print("\n[MARGINAL VALUE] AUROC gain of full over leave-one-out pairs:")
-            for chan, wo in (("rec_err", "latent_aux"), ("latent_err", "rec_aux"), ("aux_err", "rec_latent")):
+            print("\n[MARGINAL VALUE] AUROC gain of full over leave-one-out triples:")
+            for chan, wo in (("rec_err", "latent_aux_flow"), ("latent_err", "rec_aux_flow"),
+                              ("aux_err", "rec_latent_flow"), ("flow_err", "rec_latent_aux")):
                 if wo in by and not np.isnan(by[wo]["auroc"]):
                     d = by["full"]["auroc"] - by[wo]["auroc"]
                     verdict = "contributes" if d > 0.005 else ("neutral" if d > -0.005 else "HURTS fusion")
